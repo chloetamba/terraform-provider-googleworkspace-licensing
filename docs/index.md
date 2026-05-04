@@ -1,8 +1,6 @@
----
-page_title: "Google Workspace Provider"
-description: |-
-  Terraform provider for managing Google Workspace licenses and assignments.
----
+# Google Workspace Provider
+
+Terraform provider for managing Google Workspace licenses and assignments.
 
 # googleworkspace Provider
 
