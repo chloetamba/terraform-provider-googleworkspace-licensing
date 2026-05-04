@@ -1,2 +1,3 @@
-# terraform-provider-googleworkspace-license
-Provider that manages the assignment and removal of licenses to Google Workspace users
+# terraform-provider-googleworkspace
+
+Terraform provider for managing Google Workspace licenses and assignments.
