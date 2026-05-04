@@ -21,6 +21,7 @@ This provider uses a Google service account with domain-wide delegation enabled.
 provider "googleworkspace" {
   credentials             = file("credentials.json")
   impersonated_user_email = "admin@example.com"
+  customer_id             = var.customer_id
 }
 
 ```
