@@ -25,7 +25,6 @@ provider "googleworkspace" {
 }
 
 ```
-
 ## Resources
 
 googleworkspace_user_licenses

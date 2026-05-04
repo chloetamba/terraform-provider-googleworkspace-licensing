@@ -4,6 +4,8 @@ Manages a Google Workspace license assignment for a user.
 
 This resource assigns a Google Workspace product SKU to a user.
 
+### Required
+
 
 ## Example Usage
 
