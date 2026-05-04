@@ -2,14 +2,6 @@
 
 Terraform provider for managing Google Workspace licenses and assignments.
 
-## Example Usage
-
-```hcl
-provider "googleworkspace" {
-  credentials             = file("credentials.json")
-  impersonated_user_email = "admin@example.com"
-}
-
 ## Authentication
 
 This provider uses a Google service account with domain-wide delegation enabled.
@@ -22,6 +14,16 @@ This provider uses a Google service account with domain-wide delegation enabled.
 ### Optional
 
 - `customer_id` (String) The ID of the Google Workspace customer.
+
+## Example Usage
+
+```hcl
+provider "googleworkspace" {
+  credentials             = file("credentials.json")
+  impersonated_user_email = "admin@example.com"
+}
+
+```
 
 ## Resources
 
