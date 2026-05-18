@@ -14,7 +14,7 @@ func main() {
 		context.Background(),
 		provider.New,
 		providerserver.ServeOpts{
-			Address: "registry.terraform.io/local/googleworkspace-license",
+			Address: "registry.terraform.io/local/googleworkspace",
 		},
 	)
 
