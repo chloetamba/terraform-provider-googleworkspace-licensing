@@ -1,5 +1,5 @@
 version: 2
-project_name: terraform-provider-googleworkspace-license
+project_name: terraform-provider-googleworkspace
 
 before:
   hooks:
@@ -8,7 +8,7 @@ before:
 builds:
   - env:
       - CGO_ENABLED=0
-    binary: terraform-provider-googleworkspace-license
+    binary: terraform-provider-googleworkspace
     goos:
       - linux
       - darwin
@@ -21,7 +21,7 @@ archives:
   - format: zip
 
 checksum:
-  name_template: "terraform-provider-googleworkspace-license_{{ .Version }}_SHA256SUMS"
+  name_template: "terraform-provider-googleworkspace_{{ .Version }}_SHA256SUMS"
 
 signs:
   - artifacts: checksum
@@ -29,4 +29,4 @@ signs:
 release:
   github:
     owner: chloetamba
-    name: terraform-provider-googleworkspace-license
+    name: terraform-provider-googleworkspace
