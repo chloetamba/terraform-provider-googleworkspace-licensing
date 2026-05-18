@@ -25,7 +25,7 @@ func New() provider.Provider {
 }
 
 func (p *GoogleWorkspaceProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
-	resp.TypeName = "googleworkspace"
+	resp.TypeName = "googleworkspace_license"
 }
 
 func (p *GoogleWorkspaceProvider) Schema(_ context.Context, _ provider.SchemaRequest, resp *provider.SchemaResponse) {
