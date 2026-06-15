@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -26,6 +27,13 @@ type LicenseResourceModel struct {
 	UserID    types.String `tfsdk:"user_id"`
 	ProductID types.String `tfsdk:"product_id"`
 	SKUID     types.String `tfsdk:"sku_id"`
+}
+
+var licenseCache = struct {
+	sync.Mutex
+	data map[string]map[string]bool
+}{
+	data: make(map[string]map[string]bool),
 }
 
 func NewLicenseResource() resource.Resource {
@@ -59,9 +67,6 @@ func (r *LicenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 			"sku_id": schema.StringAttribute{
 				Required: true,
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.RequiresReplace(),
-				},
 			},
 		},
 	}
@@ -84,22 +89,8 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 
-	jsonKey := []byte(r.config.ServiceAccountKey.ValueString())
-
-	creds, err := google.CredentialsFromJSONWithParams(ctx, jsonKey, google.CredentialsParams{
-		Scopes: []string{
-			"https://www.googleapis.com/auth/apps.licensing",
-		},
-		Subject: r.config.ImpersonatedAdmin.ValueString(),
-	})
-	if err != nil {
-		resp.Diagnostics.AddError("Google credentials creation failed", err.Error())
-		return
-	}
-
-	service, err := admin.NewService(ctx, option.WithCredentials(creds))
-	if err != nil {
-		resp.Diagnostics.AddError("Google credentials creation failed", err.Error())
+	service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
+	if !ok {
 		return
 	}
 
@@ -107,7 +98,7 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 		UserId: plan.UserID.ValueString(),
 	}
 
-	_, err = service.LicenseAssignments.Insert(
+	_, err := service.LicenseAssignments.Insert(
 		plan.ProductID.ValueString(),
 		plan.SKUID.ValueString(),
 		assignment,
@@ -127,6 +118,8 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 		plan.SKUID.ValueString(),
 		plan.UserID.ValueString(),
 	))
+
+	addUserToCache(plan.ProductID.ValueString(), plan.SKUID.ValueString(), plan.UserID.ValueString())
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -156,38 +149,57 @@ func (r *LicenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 		state.UserID = types.StringValue(parts[2])
 	}
 
-	jsonKey := []byte(r.config.ServiceAccountKey.ValueString())
+	cacheKey := buildCacheKey(state.ProductID.ValueString(), state.SKUID.ValueString())
+	userID := state.UserID.ValueString()
 
-	creds, err := google.CredentialsFromJSONWithParams(ctx, jsonKey, google.CredentialsParams{
-		Scopes: []string{
-			"https://www.googleapis.com/auth/apps.licensing",
-		},
-		Subject: r.config.ImpersonatedAdmin.ValueString(),
-	})
-	if err != nil {
-		resp.Diagnostics.AddError("Google credentials creation failed", err.Error())
-		return
-	}
+	licenseCache.Lock()
+	usersForLicense, exists := licenseCache.data[cacheKey]
+	licenseCache.Unlock()
 
-	service, err := admin.NewService(ctx, option.WithCredentials(creds))
-	if err != nil {
-		resp.Diagnostics.AddError("Google client creation failed", err.Error())
-		return
-	}
-
-	_, err = service.LicenseAssignments.Get(
-		state.ProductID.ValueString(),
-		state.SKUID.ValueString(),
-		state.UserID.ValueString(),
-	).Do()
-
-	if err != nil {
-		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 {
-			resp.State.RemoveResource(ctx)
+	if !exists {
+		service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
+		if !ok {
 			return
 		}
 
-		resp.Diagnostics.AddError("Failed to read license", err.Error())
+		usersForLicense = make(map[string]bool)
+
+		customerID := r.config.CustomerID.ValueString()
+		if customerID == "" {
+			customerID = "my_customer"
+		}
+
+		call := service.LicenseAssignments.ListForProductAndSku(
+			state.ProductID.ValueString(),
+			state.SKUID.ValueString(),
+			customerID,
+		)
+
+		for {
+			assignments, err := call.Do()
+			if err != nil {
+				resp.Diagnostics.AddError("Failed to list licenses", err.Error())
+				return
+			}
+
+			for _, assignment := range assignments.Items {
+				usersForLicense[assignment.UserId] = true
+			}
+
+			if assignments.NextPageToken == "" {
+				break
+			}
+
+			call.PageToken(assignments.NextPageToken)
+		}
+
+		licenseCache.Lock()
+		licenseCache.data[cacheKey] = usersForLicense
+		licenseCache.Unlock()
+	}
+
+	if !usersForLicense[userID] {
+		resp.State.RemoveResource(ctx)
 		return
 	}
 
@@ -220,26 +232,12 @@ func (r *LicenseResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 
-	jsonKey := []byte(r.config.ServiceAccountKey.ValueString())
-
-	creds, err := google.CredentialsFromJSONWithParams(ctx, jsonKey, google.CredentialsParams{
-		Scopes: []string{
-			"https://www.googleapis.com/auth/apps.licensing",
-		},
-		Subject: r.config.ImpersonatedAdmin.ValueString(),
-	})
-	if err != nil {
-		resp.Diagnostics.AddError("Google credentials creation failed", err.Error())
+	service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
+	if !ok {
 		return
 	}
 
-	service, err := admin.NewService(ctx, option.WithCredentials(creds))
-	if err != nil {
-		resp.Diagnostics.AddError("Google client creation failed", err.Error())
-		return
-	}
-
-	_, err = service.LicenseAssignments.Update(
+	_, err := service.LicenseAssignments.Update(
 		plan.ProductID.ValueString(),
 		plan.SKUID.ValueString(),
 		plan.UserID.ValueString(),
@@ -252,6 +250,9 @@ func (r *LicenseResource) Update(ctx context.Context, req resource.UpdateRequest
 		resp.Diagnostics.AddError("Failed to update license", err.Error())
 		return
 	}
+
+	removeUserFromCache(state.ProductID.ValueString(), state.SKUID.ValueString(), state.UserID.ValueString())
+	addUserToCache(plan.ProductID.ValueString(), plan.SKUID.ValueString(), plan.UserID.ValueString())
 
 	plan.ID = types.StringValue(fmt.Sprintf("%s/%s/%s",
 		plan.ProductID.ValueString(),
@@ -270,26 +271,12 @@ func (r *LicenseResource) Delete(ctx context.Context, req resource.DeleteRequest
 		return
 	}
 
-	jsonKey := []byte(r.config.ServiceAccountKey.ValueString())
-
-	creds, err := google.CredentialsFromJSONWithParams(ctx, jsonKey, google.CredentialsParams{
-		Scopes: []string{
-			"https://www.googleapis.com/auth/apps.licensing",
-		},
-		Subject: r.config.ImpersonatedAdmin.ValueString(),
-	})
-	if err != nil {
-		resp.Diagnostics.AddError("Google credentials creation failed", err.Error())
+	service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
+	if !ok {
 		return
 	}
 
-	service, err := admin.NewService(ctx, option.WithCredentials(creds))
-	if err != nil {
-		resp.Diagnostics.AddError("Google client creation failed", err.Error())
-		return
-	}
-
-	_, err = service.LicenseAssignments.Delete(
+	_, err := service.LicenseAssignments.Delete(
 		state.ProductID.ValueString(),
 		state.SKUID.ValueString(),
 		state.UserID.ValueString(),
@@ -299,8 +286,61 @@ func (r *LicenseResource) Delete(ctx context.Context, req resource.DeleteRequest
 		resp.Diagnostics.AddError("Failed to delete license", err.Error())
 		return
 	}
+
+	removeUserFromCache(state.ProductID.ValueString(), state.SKUID.ValueString(), state.UserID.ValueString())
 }
 
 func (r *LicenseResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+}
+
+func (r *LicenseResource) newLicensingService(ctx context.Context, diagnostics interface {
+	AddError(summary string, detail string)
+}) (*admin.Service, bool) {
+	jsonKey := []byte(r.config.ServiceAccountKey.ValueString())
+
+	creds, err := google.CredentialsFromJSONWithParams(ctx, jsonKey, google.CredentialsParams{
+		Scopes: []string{
+			"https://www.googleapis.com/auth/apps.licensing",
+		},
+		Subject: r.config.ImpersonatedAdmin.ValueString(),
+	})
+	if err != nil {
+		diagnostics.AddError("Google credentials creation failed", err.Error())
+		return nil, false
+	}
+
+	service, err := admin.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		diagnostics.AddError("Google client creation failed", err.Error())
+		return nil, false
+	}
+
+	return service, true
+}
+
+func buildCacheKey(productID string, skuID string) string {
+	return productID + "/" + skuID
+}
+
+func addUserToCache(productID string, skuID string, userID string) {
+	cacheKey := buildCacheKey(productID, skuID)
+
+	licenseCache.Lock()
+	defer licenseCache.Unlock()
+
+	if licenseCache.data[cacheKey] != nil {
+		licenseCache.data[cacheKey][userID] = true
+	}
+}
+
+func removeUserFromCache(productID string, skuID string, userID string) {
+	cacheKey := buildCacheKey(productID, skuID)
+
+	licenseCache.Lock()
+	defer licenseCache.Unlock()
+
+	if licenseCache.data[cacheKey] != nil {
+		delete(licenseCache.data[cacheKey], userID)
+	}
 }
