@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
@@ -155,6 +156,12 @@ func (r *LicenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 	licenseCache.Lock()
 	usersForLicense, exists := licenseCache.data[cacheKey]
 
+	if exists {
+		log.Printf("[DEBUG] Cache HIT for %s", cacheKey)
+	} else {
+		log.Printf("[DEBUG] Cache MISS for %s", cacheKey)
+	}
+
 	if !exists {
 		licenseCache.Unlock()
 
@@ -175,6 +182,8 @@ func (r *LicenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 			state.SKUID.ValueString(),
 			customerID,
 		)
+
+		log.Printf("[DEBUG] Calling ListForProductAndSku for %s", cacheKey)
 
 		for {
 			assignments, err := call.Do()
