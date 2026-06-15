@@ -154,9 +154,10 @@ func (r *LicenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 
 	licenseCache.Lock()
 	usersForLicense, exists := licenseCache.data[cacheKey]
-	licenseCache.Unlock()
 
 	if !exists {
+		licenseCache.Unlock()
+
 		service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
 		if !ok {
 			return
@@ -195,8 +196,9 @@ func (r *LicenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 
 		licenseCache.Lock()
 		licenseCache.data[cacheKey] = usersForLicense
-		licenseCache.Unlock()
 	}
+
+	licenseCache.Unlock()
 
 	if !usersForLicense[userID] {
 		resp.State.RemoveResource(ctx)
