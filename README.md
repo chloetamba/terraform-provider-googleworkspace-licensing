@@ -17,7 +17,7 @@ It currently supports assigning and removing Workspace licenses for users using 
 
 ## Supported Resource
 
-- `googleworkspace_user_license`
+- `googleworkspace_license`
 
 ## Project Status
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"log"
 
-	"terraform-provider-googleworkspace/internal/provider"
+	"terraform-provider-googleworkspace-licensing/internal/provider"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 )
@@ -14,7 +14,7 @@ func main() {
 		context.Background(),
 		provider.New,
 		providerserver.ServeOpts{
-			Address: "registry.terraform.io/local/googleworkspace",
+			Address: "registry.terraform.io/local/googleworkspace-licensing",
 		},
 	)
 

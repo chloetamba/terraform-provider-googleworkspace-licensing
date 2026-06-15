@@ -1,4 +1,4 @@
-module terraform-provider-googleworkspace
+module terraform-provider-googleworkspace-licensing
 
 go 1.26.2
 
