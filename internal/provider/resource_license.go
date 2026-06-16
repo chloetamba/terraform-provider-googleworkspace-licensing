@@ -107,8 +107,33 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 	).Do()
 
 	if err != nil {
-		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 409 {
-			resp.Diagnostics.AddWarning("License already assigned", "The license already exists, continuing")
+		if gerr, ok := err.(*googleapi.Error); ok {
+			switch gerr.Code {
+			case 409:
+				resp.Diagnostics.AddWarning(
+					"License already assigned",
+					"The license already exists, continuing",
+				)
+
+			case 412:
+				_, updateErr := service.LicenseAssignments.Update(
+					plan.ProductID.ValueString(),
+					plan.SKUID.ValueString(),
+					plan.UserID.ValueString(),
+					&admin.LicenseAssignment{
+						UserId: plan.UserID.ValueString(),
+					},
+				).Do()
+
+				if updateErr != nil {
+					resp.Diagnostics.AddError("Failed to reassign license", updateErr.Error())
+					return
+				}
+
+			default:
+				resp.Diagnostics.AddError("Failed to assign license", err.Error())
+				return
+			}
 		} else {
 			resp.Diagnostics.AddError("Failed to assign license", err.Error())
 			return
@@ -121,7 +146,11 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 		plan.UserID.ValueString(),
 	))
 
-	addUserToCache(plan.ProductID.ValueString(), plan.SKUID.ValueString(), plan.UserID.ValueString())
+	addUserToCache(
+		plan.ProductID.ValueString(),
+		plan.SKUID.ValueString(),
+		plan.UserID.ValueString(),
+	)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
