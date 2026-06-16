@@ -110,12 +110,19 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 		if gerr, ok := err.(*googleapi.Error); ok {
 			switch gerr.Code {
 			case 409:
-				resp.Diagnostics.AddWarning(
-					"License already assigned",
-					"The license already exists, continuing",
+				log.Printf("[DEBUG] License already assigned for %s/%s/%s",
+					plan.ProductID.ValueString(),
+					plan.SKUID.ValueString(),
+					plan.UserID.ValueString(),
 				)
 
 			case 412:
+				log.Printf("[DEBUG] Insert returned 412, calling Update for %s/%s/%s",
+					plan.ProductID.ValueString(),
+					plan.SKUID.ValueString(),
+					plan.UserID.ValueString(),
+				)
+
 				_, updateErr := service.LicenseAssignments.Update(
 					plan.ProductID.ValueString(),
 					plan.SKUID.ValueString(),
