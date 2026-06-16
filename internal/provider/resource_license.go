@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
@@ -186,7 +187,27 @@ func (r *LicenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 		log.Printf("[DEBUG] Calling ListForProductAndSku for %s", cacheKey)
 
 		for {
-			assignments, err := call.Do()
+			var assignments *admin.LicenseAssignmentList
+			var err error
+
+			for attempt := 1; attempt <= 5; attempt++ {
+				assignments, err = call.Do()
+				if err == nil {
+					break
+				}
+
+				if gerr, ok := err.(*googleapi.Error); ok &&
+					gerr.Code == 403 &&
+					strings.Contains(err.Error(), "RATE_LIMIT_EXCEEDED") {
+
+					time.Sleep(time.Duration(attempt) * 15 * time.Second)
+					continue
+				}
+
+				resp.Diagnostics.AddError("Failed to list licenses", err.Error())
+				return
+			}
+
 			if err != nil {
 				resp.Diagnostics.AddError("Failed to list licenses", err.Error())
 				return
