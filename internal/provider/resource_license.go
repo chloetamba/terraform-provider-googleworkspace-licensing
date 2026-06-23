@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"fmt"
-	"log"
 	"strings"
 	"sync"
 	"time"
@@ -15,10 +14,28 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"golang.org/x/oauth2/google"
+	"golang.org/x/time/rate"
 	"google.golang.org/api/googleapi"
 	admin "google.golang.org/api/licensing/v1"
 	"google.golang.org/api/option"
 )
+
+var (
+	licensingLimiterOnce sync.Once
+	licensingLimiter     *rate.Limiter
+)
+
+func getLicensingLimiter() *rate.Limiter {
+	licensingLimiterOnce.Do(func() {
+		licensingLimiter = rate.NewLimiter(rate.Every(800*time.Millisecond), 1)
+	})
+
+	return licensingLimiter
+}
+
+func waitLicensingRateLimit(ctx context.Context) error {
+	return getLicensingLimiter().Wait(ctx)
+}
 
 type LicenseResource struct {
 	config GoogleWorkspaceProviderModel
@@ -31,19 +48,12 @@ type LicenseResourceModel struct {
 	SKUID     types.String `tfsdk:"sku_id"`
 }
 
-var licenseCache = struct {
-	sync.Mutex
-	data map[string]map[string]bool
-}{
-	data: make(map[string]map[string]bool),
-}
-
 func NewLicenseResource() resource.Resource {
 	return &LicenseResource{}
 }
 
 func (r *LicenseResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
-	resp.TypeName = req.ProviderTypeName + "_license"
+	resp.TypeName = req.ProviderTypeName + "_user_license"
 }
 
 func (r *LicenseResource) Schema(_ context.Context, _ resource.SchemaRequest, resp *resource.SchemaResponse) {
@@ -69,6 +79,9 @@ func (r *LicenseResource) Schema(_ context.Context, _ resource.SchemaRequest, re
 			},
 			"sku_id": schema.StringAttribute{
 				Required: true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.RequiresReplace(),
+				},
 			},
 		},
 	}
@@ -83,6 +96,123 @@ func (r *LicenseResource) Configure(ctx context.Context, req resource.ConfigureR
 	r.config = config
 }
 
+func retryGoogle(ctx context.Context, f func() error) error {
+	delays := []time.Duration{
+		1 * time.Second,
+		2 * time.Second,
+		4 * time.Second,
+		8 * time.Second,
+		16 * time.Second,
+		30 * time.Second,
+		45 * time.Second,
+		60 * time.Second,
+	}
+
+	var err error
+
+	for i, delay := range delays {
+		if err := waitLicensingRateLimit(ctx); err != nil {
+			return err
+		}
+
+		err = f()
+		if err == nil {
+			return nil
+		}
+
+		if !isRetryableError(err) {
+			return err
+		}
+
+		if i == len(delays)-1 {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+
+	return err
+}
+
+func isRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	if gerr, ok := err.(*googleapi.Error); ok {
+		return isRetryableGoogleError(gerr)
+	}
+
+	msg := strings.ToLower(err.Error())
+
+	return strings.Contains(msg, "cannot fetch token") ||
+		strings.Contains(msg, "internal_failure") ||
+		strings.Contains(msg, "backend error") ||
+		strings.Contains(msg, "backenderror") ||
+		strings.Contains(msg, "503") ||
+		strings.Contains(msg, "502") ||
+		strings.Contains(msg, "504") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "temporary failure")
+}
+
+func isRetryableGoogleError(err *googleapi.Error) bool {
+	switch err.Code {
+	case 429, 500, 502, 503, 504:
+		return true
+	case 403:
+		for _, apiErr := range err.Errors {
+			if apiErr.Reason == "rateLimitExceeded" ||
+				apiErr.Reason == "userRateLimitExceeded" {
+				return true
+			}
+		}
+	case 412:
+		for _, apiErr := range err.Errors {
+			if apiErr.Reason == "conditionNotMet" {
+				return true
+			}
+		}
+
+		if strings.Contains(err.Message, "different SKU") ||
+			strings.Contains(err.Message, "already has a license of the product") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (r *LicenseResource) newLicensingService(ctx context.Context) (*admin.Service, error) {
+	jsonKey := []byte(r.config.ServiceAccountKey.ValueString())
+
+	creds, err := google.CredentialsFromJSONWithParams(ctx, jsonKey, google.CredentialsParams{
+		Scopes: []string{
+			"https://www.googleapis.com/auth/apps.licensing",
+		},
+		Subject: r.config.ImpersonatedAdmin.ValueString(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	service, err := admin.NewService(ctx, option.WithCredentials(creds))
+	if err != nil {
+		return nil, err
+	}
+
+	return service, nil
+}
+
+func licenseID(productID, skuID, userID string) string {
+	return fmt.Sprintf("%s/%s/%s", productID, skuID, userID)
+}
+
 func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest, resp *resource.CreateResponse) {
 	var plan LicenseResourceModel
 
@@ -91,8 +221,9 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 
-	service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
-	if !ok {
+	service, err := r.newLicensingService(ctx)
+	if err != nil {
+		resp.Diagnostics.AddError("Google client creation failed", err.Error())
 		return
 	}
 
@@ -100,64 +231,33 @@ func (r *LicenseResource) Create(ctx context.Context, req resource.CreateRequest
 		UserId: plan.UserID.ValueString(),
 	}
 
-	_, err := service.LicenseAssignments.Insert(
-		plan.ProductID.ValueString(),
-		plan.SKUID.ValueString(),
-		assignment,
-	).Do()
+	err = retryGoogle(ctx, func() error {
+		_, err := service.LicenseAssignments.Insert(
+			plan.ProductID.ValueString(),
+			plan.SKUID.ValueString(),
+			assignment,
+		).Do()
+
+		return err
+	})
 
 	if err != nil {
-		if gerr, ok := err.(*googleapi.Error); ok {
-			switch gerr.Code {
-			case 409:
-				log.Printf("[DEBUG] License already assigned for %s/%s/%s",
-					plan.ProductID.ValueString(),
-					plan.SKUID.ValueString(),
-					plan.UserID.ValueString(),
-				)
-
-			case 412:
-				log.Printf("[DEBUG] Insert returned 412, calling Update for %s/%s/%s",
-					plan.ProductID.ValueString(),
-					plan.SKUID.ValueString(),
-					plan.UserID.ValueString(),
-				)
-
-				_, updateErr := service.LicenseAssignments.Update(
-					plan.ProductID.ValueString(),
-					plan.SKUID.ValueString(),
-					plan.UserID.ValueString(),
-					&admin.LicenseAssignment{
-						UserId: plan.UserID.ValueString(),
-					},
-				).Do()
-
-				if updateErr != nil {
-					resp.Diagnostics.AddError("Failed to reassign license", updateErr.Error())
-					return
-				}
-
-			default:
-				resp.Diagnostics.AddError("Failed to assign license", err.Error())
-				return
-			}
+		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 409 {
+			resp.Diagnostics.AddWarning(
+				"License already assigned",
+				"The license already exists, continuing.",
+			)
 		} else {
 			resp.Diagnostics.AddError("Failed to assign license", err.Error())
 			return
 		}
 	}
 
-	plan.ID = types.StringValue(fmt.Sprintf("%s/%s/%s",
+	plan.ID = types.StringValue(licenseID(
 		plan.ProductID.ValueString(),
 		plan.SKUID.ValueString(),
 		plan.UserID.ValueString(),
 	))
-
-	addUserToCache(
-		plan.ProductID.ValueString(),
-		plan.SKUID.ValueString(),
-		plan.UserID.ValueString(),
-	)
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
@@ -187,148 +287,33 @@ func (r *LicenseResource) Read(ctx context.Context, req resource.ReadRequest, re
 		state.UserID = types.StringValue(parts[2])
 	}
 
-	cacheKey := buildCacheKey(state.ProductID.ValueString(), state.SKUID.ValueString())
-	userID := state.UserID.ValueString()
-
-	licenseCache.Lock()
-	usersForLicense, exists := licenseCache.data[cacheKey]
-
-	if exists {
-		log.Printf("[DEBUG] Cache HIT for %s", cacheKey)
-	} else {
-		log.Printf("[DEBUG] Cache MISS for %s", cacheKey)
+	service, err := r.newLicensingService(ctx)
+	if err != nil {
+		resp.Diagnostics.AddError("Google client creation failed", err.Error())
+		return
 	}
 
-	if !exists {
-		licenseCache.Unlock()
+	err = retryGoogle(ctx, func() error {
+		_, err := service.LicenseAssignments.Get(
+			state.ProductID.ValueString(),
+			state.SKUID.ValueString(),
+			state.UserID.ValueString(),
+		).Do()
 
-		service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
-		if !ok {
+		return err
+	})
+
+	if err != nil {
+		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 {
+			resp.State.RemoveResource(ctx)
 			return
 		}
 
-		usersForLicense = make(map[string]bool)
-
-		customerID := r.config.CustomerID.ValueString()
-		if customerID == "" {
-			customerID = "my_customer"
-		}
-
-		call := service.LicenseAssignments.ListForProductAndSku(
-			state.ProductID.ValueString(),
-			state.SKUID.ValueString(),
-			customerID,
-		)
-
-		log.Printf("[DEBUG] Calling ListForProductAndSku for %s", cacheKey)
-
-		for {
-			var assignments *admin.LicenseAssignmentList
-			var err error
-
-			for attempt := 1; attempt <= 5; attempt++ {
-				assignments, err = call.Do()
-				if err == nil {
-					break
-				}
-
-				if gerr, ok := err.(*googleapi.Error); ok &&
-					gerr.Code == 403 &&
-					strings.Contains(err.Error(), "RATE_LIMIT_EXCEEDED") {
-
-					time.Sleep(time.Duration(attempt) * 15 * time.Second)
-					continue
-				}
-
-				resp.Diagnostics.AddError("Failed to list licenses", err.Error())
-				return
-			}
-
-			if err != nil {
-				resp.Diagnostics.AddError("Failed to list licenses", err.Error())
-				return
-			}
-
-			for _, assignment := range assignments.Items {
-				usersForLicense[assignment.UserId] = true
-			}
-
-			if assignments.NextPageToken == "" {
-				break
-			}
-
-			call.PageToken(assignments.NextPageToken)
-		}
-
-		licenseCache.Lock()
-		licenseCache.data[cacheKey] = usersForLicense
-	}
-
-	licenseCache.Unlock()
-
-	if !usersForLicense[userID] {
-		resp.State.RemoveResource(ctx)
+		resp.Diagnostics.AddError("Failed to read license", err.Error())
 		return
 	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
-}
-
-func (r *LicenseResource) Update(ctx context.Context, req resource.UpdateRequest, resp *resource.UpdateResponse) {
-	var plan LicenseResourceModel
-	var state LicenseResourceModel
-
-	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
-	resp.Diagnostics.Append(req.State.Get(ctx, &state)...)
-	if resp.Diagnostics.HasError() {
-		return
-	}
-
-	if state.ProductID.ValueString() != plan.ProductID.ValueString() {
-		resp.Diagnostics.AddError(
-			"Product update not supported",
-			"Changing product_id is not supported. Delete and recreate the license assignment instead.",
-		)
-		return
-	}
-
-	if state.UserID.ValueString() != plan.UserID.ValueString() {
-		resp.Diagnostics.AddError(
-			"User update not supported",
-			"Changing user_id is not supported. Delete and recreate the license assignment instead.",
-		)
-		return
-	}
-
-	service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
-	if !ok {
-		return
-	}
-
-	_, err := service.LicenseAssignments.Update(
-		plan.ProductID.ValueString(),
-		plan.SKUID.ValueString(),
-		plan.UserID.ValueString(),
-		&admin.LicenseAssignment{
-			UserId: plan.UserID.ValueString(),
-		},
-	).Do()
-
-	if err != nil {
-		resp.Diagnostics.AddError("Failed to update license", err.Error())
-		return
-	}
-
-	removeUserFromCache(state.ProductID.ValueString(), state.SKUID.ValueString(), state.UserID.ValueString())
-	addUserToCache(plan.ProductID.ValueString(), plan.SKUID.ValueString(), plan.UserID.ValueString())
-
-	plan.ID = types.StringValue(fmt.Sprintf("%s/%s/%s",
-		plan.ProductID.ValueString(),
-		plan.SKUID.ValueString(),
-		plan.UserID.ValueString(),
-	))
-
-	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
 func (r *LicenseResource) Delete(ctx context.Context, req resource.DeleteRequest, resp *resource.DeleteResponse) {
@@ -339,76 +324,43 @@ func (r *LicenseResource) Delete(ctx context.Context, req resource.DeleteRequest
 		return
 	}
 
-	service, ok := r.newLicensingService(ctx, &resp.Diagnostics)
-	if !ok {
+	service, err := r.newLicensingService(ctx)
+	if err != nil {
+		resp.Diagnostics.AddError("Google client creation failed", err.Error())
 		return
 	}
 
-	_, err := service.LicenseAssignments.Delete(
-		state.ProductID.ValueString(),
-		state.SKUID.ValueString(),
-		state.UserID.ValueString(),
-	).Do()
+	err = retryGoogle(ctx, func() error {
+		_, err := service.LicenseAssignments.Delete(
+			state.ProductID.ValueString(),
+			state.SKUID.ValueString(),
+			state.UserID.ValueString(),
+		).Do()
+
+		return err
+	})
 
 	if err != nil {
+		if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 {
+			return
+		}
+
 		resp.Diagnostics.AddError("Failed to delete license", err.Error())
 		return
 	}
+}
 
-	removeUserFromCache(state.ProductID.ValueString(), state.SKUID.ValueString(), state.UserID.ValueString())
+func (r *LicenseResource) Update(
+	ctx context.Context,
+	req resource.UpdateRequest,
+	resp *resource.UpdateResponse,
+) {
+	resp.Diagnostics.AddError(
+		"Update not supported",
+		"This resource only supports Create/Delete replacement operations.",
+	)
 }
 
 func (r *LicenseResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
 	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
-}
-
-func (r *LicenseResource) newLicensingService(ctx context.Context, diagnostics interface {
-	AddError(summary string, detail string)
-}) (*admin.Service, bool) {
-	jsonKey := []byte(r.config.ServiceAccountKey.ValueString())
-
-	creds, err := google.CredentialsFromJSONWithParams(ctx, jsonKey, google.CredentialsParams{
-		Scopes: []string{
-			"https://www.googleapis.com/auth/apps.licensing",
-		},
-		Subject: r.config.ImpersonatedAdmin.ValueString(),
-	})
-	if err != nil {
-		diagnostics.AddError("Google credentials creation failed", err.Error())
-		return nil, false
-	}
-
-	service, err := admin.NewService(ctx, option.WithCredentials(creds))
-	if err != nil {
-		diagnostics.AddError("Google client creation failed", err.Error())
-		return nil, false
-	}
-
-	return service, true
-}
-
-func buildCacheKey(productID string, skuID string) string {
-	return productID + "/" + skuID
-}
-
-func addUserToCache(productID string, skuID string, userID string) {
-	cacheKey := buildCacheKey(productID, skuID)
-
-	licenseCache.Lock()
-	defer licenseCache.Unlock()
-
-	if licenseCache.data[cacheKey] != nil {
-		licenseCache.data[cacheKey][userID] = true
-	}
-}
-
-func removeUserFromCache(productID string, skuID string, userID string) {
-	cacheKey := buildCacheKey(productID, skuID)
-
-	licenseCache.Lock()
-	defer licenseCache.Unlock()
-
-	if licenseCache.data[cacheKey] != nil {
-		delete(licenseCache.data[cacheKey], userID)
-	}
 }
